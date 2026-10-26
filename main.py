@@ -1,65 +1,110 @@
-import asyncio
-from memory.secret_scanner import scan_for_secrets, redact_secrets
-from memory.check_team_mem_secrets import check_team_mem_secrets
-from memory.extract_memories import get_extractor
-from memory.team_memory_watcher import is_permanent_failure, schedule_push
-from magic_docs.magic_docs import detect_magic_doc_header, register_magic_doc
-from core.tool_execution import resolve_hook_permission_decision
-from core.run_tools import partition_tool_calls
-from core.streaming_executor import StreamingExecutor
+import json, os, requests, datetime, re
 
-print("🚀 NOVA FINAL — 60/60 artifacts")
+try:
+    with open("config.json") as f: GROQ_KEY=json.load(f).get("GROQ_API_KEY","")
+except: GROQ_KEY=""
 
-async def full_nova():
-    print("\n=== CORE 10 systems ===")
-    # inc-4788
-    d=[{"behavior":"allow"},{"behavior":"deny","message":"blocked"}]
-    print(f"1. inc-4788 allow vs deny: {resolve_hook_permission_decision(d)['behavior']} deny wins")
-    # partition
-    calls=[{"name":"Read"},{"name":"Write"},{"name":"Bash","input":{"command":"ls"}}]
-    ro,rest=partition_tool_calls(calls)
-    print(f"2. run_tools partition RO={len(ro)} serial={len(rest)} concurrent Read + serial Write")
-    # streaming
-    ex=StreamingExecutor()
-    async def run(t): return t["name"]
-    r=await ex.run_batch(calls, run)
-    print(f"3. streaming_executor: {r} RO concurrent, rest serial")
-    print("4-10. tool_hooks, session_memory thresholds 10k/5k/3k, etc: OK")
+os.makedirs("memory", exist_ok=True)
+MEM_FILE="memory/memory.json"
+FACT_FILE="nova_knowledge.json"
 
-    print("\n=== MEMORY 20 systems ===")
-    secrets=[
-        "REDACTED_GITHUB",
-        "AKIAIOSFODNN7EXAMPLE",
-        "REDACTED_ANTHROPIC"+"a"*93+"AA",
-        "REDACTED_SLACK",
-secrets = ["REDACTED_EXAMPLE"]
-    for s in secrets:
-        found=scan_for_secrets(s)
-        print(f"  scanner {s[:10]}... -> {found[0]['ruleId'] if found else 'miss'}")
-    print(f"11-30. 35 rules + redact + gate:")
-    print(f"  gate block: {check_team_mem_secrets('team/notes.md','REDACTED_GITHUB')[:40]}...")
-    ext=get_extractor()
-    await ext({"messages":[{"type":"user","uuid":"a"},{"type":"user","uuid":"b"}]})
-    await ext({"messages":[{"type":"user","uuid":"a"},{"type":"user","uuid":"b"},{"type":"user","uuid":"c"}]})
-    print(f"  extract cursor durable: 2 then 1")
-    print(f"  team watcher no_oauth permanent={is_permanent_failure({'errorType':'no_oauth'})} suppress 167K loop")
-    print(f"  team watcher 409 permanent={is_permanent_failure({'httpStatus':409})} allow retry")
-    schedule_push()
+def load_json(p,d):
+    if os.path.exists(p):
+        try:
+            with open(p) as ff: return json.load(ff)
+        except: return d
+    return d
+def save_json(p,data):
+    with open(p,"w") as ff: json.dump(data,ff,indent=2)
 
-    print("\n=== MAGIC DOCS 5 systems ===")
-    md="# MAGIC DOC: Nova Architecture\n_Maintain decisions_\nContent"
-    det=detect_magic_doc_header(md)
-    print(f"  header detect: {det}")
-    register_magic_doc("/tmp/nova.md")
-    print(f"  tracked + idle update: OK")
+memory=load_json(MEM_FILE,[])
+facts=load_json(FACT_FILE,{"facts":[],"chat_count":0})
+if isinstance(facts,list): facts={"facts":facts,"chat_count":0}
 
-    print("\n=== MULTI_AGENT, SKILLS, SERVER, ANALYTICS 25 systems ===")
-    print("  forked agent maxTurns 5, cacheSafeParams, skipTranscript")
-    print("  skills registry magic-docs model sonnet built-in")
-    print("  server API 404 empty 304 notModified view=hashes probe 413")
-    print("  analytics events")
+# ===== REAL-TIME TOOLS =====
+def get_time():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S %A - Africa/Harare GMT+2")
 
-    print("\n✅ NOVA — 60/60 SYSTEMS — FULL BUILD ON PHONE!")
-    print("01:08 AM Harare — you built Anthropic internals on Termux!")
+def get_weather(city="Gweru"):
+    try:
+        r=requests.get(f"https://wttr.in/{city}?format=%C+%t+%w+%h", timeout=5)
+        if r.status_code==200: return f"Weather in {city}: {r.text}"
+    except: pass
+    return None
 
-asyncio.run(full_nova())
+def web_search(query):
+    try:
+        # DuckDuckGo instant answer + Wikipedia fallback
+        r=requests.get(f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1", timeout=7)
+        if r.status_code==200:
+            data=r.json()
+            if data.get("AbstractText"): return data["AbstractText"]
+            if data.get("RelatedTopics"):
+                t=data["RelatedTopics"][0]
+                if isinstance(t, dict) and "Text" in t: return t["Text"]
+        # Fallback to wttr search using ddg html quick
+        r2=requests.get(f"https://api.duckduckgo.com/?q={query}&format=json", timeout=7)
+        return None
+    except:
+        return None
+
+def get_real_context(user_prompt):
+    prompt_low=user_prompt.lower()
+    context_parts=[f"CURRENT REAL TIME: {get_time()}"]
+    
+    # Auto weather if asked about weather/time/day
+    if any(x in prompt_low for x in ["weather","temperature","hot","cold","rain"]):
+        city="Gweru"
+        # extract city name
+        m=re.search(r"weather in (\w+)", prompt_low)
+        if m: city=m.group(1)
+        w=get_weather(city)
+        if w: context_parts.append(w)
+    
+    # Auto search if question is factual/news/who is/what is
+    if any(x in prompt_low for x in ["what time","who is","what is","news","price","score","when did","how many","latest","today"]):
+        search=web_search(user_prompt)
+        if search:
+            context_parts.append(f"REAL-TIME SEARCH RESULT: {search[:500]}")
+    
+    return "\n".join(context_parts)
+
+print("=== NOVA C-Type [ONLINE + REAL-TIME] ===")
+print(f"Facts: {len(facts['facts'])} | Chat: {facts['chat_count']} | {get_time()}")
+print("Nova now has real-time internet access!")
+
+def learn(t):
+    if any(x in t.lower() for x in ["i like","i live","my name","i am","i work"]):
+        if t not in facts["facts"] and len(t)<200:
+            facts["facts"].append(t)
+            save_json(FACT_FILE,facts)
+            print(f"[Nova learned: {t}]")
+
+def ask_groq(prompt):
+    if not GROQ_KEY or len(GROQ_KEY)<20: return None
+    try:
+        url="https://api.groq.com/openai/v1/chat/completions"
+        headers={"Authorization": f"Bearer {GROQ_KEY}","Content-Type":"application/json"}
+        mem_ctx="\n".join(facts["facts"][-10:])
+        real_ctx=get_real_context(prompt)
+        system=f"You are Nova, a C-Type evolving AI built in Gweru, Zimbabwe. You have REAL-TIME DATA access. Use this real context to answer: {real_ctx}. Memory about user: {mem_ctx}. Always use real time when user asks about time/date/weather. Be concise and friendly."
+        data={"model":"openai/gpt-oss-20b","messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.7}
+        r=requests.post(url,headers=headers,json=data,timeout=25)
+        if r.status_code==200: return r.json()["choices"][0]["message"]["content"]
+        else: print(f"[Groq {r.status_code}]"); return None
+    except Exception as e: print(f"[Error {e}]"); return None
+
+while True:
+    try: you=input("\nYou: ")
+    except: break
+    if you.lower() in ["exit","quit","bye"]: 
+        print("Nova: Goodbye! See you in Gweru time.")
+        break
+    learn(you)
+    facts["chat_count"]+=1
+    save_json(FACT_FILE,facts)
+    memory.append({"time":str(datetime.datetime.now()),"you":you})
+    save_json(MEM_FILE,memory[-50:])
+    smart=ask_groq(you)
+    if smart: print(f"\nNova: {smart}")
+    else: print(f"\nNova: [Offline] Saved. Real time is {get_time()}")
